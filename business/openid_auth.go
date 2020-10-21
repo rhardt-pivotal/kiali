@@ -384,6 +384,7 @@ func RequestOpenIdToken(openIdParams *OpenIdCallbackParams, redirect_uri string)
 	requestParams.Set("redirect_uri", redirect_uri)
 	if len(cfg.ClientSecret) == 0 {
 		requestParams.Set("client_id", cfg.ClientId)
+		requestParams.Set("client_secret", "")
 	}
 
 	tokenRequest, err := http.NewRequest(http.MethodPost, openIdMetadata.TokenURL, strings.NewReader(requestParams.Encode()))
