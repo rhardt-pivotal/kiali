@@ -1,4 +1,4 @@
-package prometheus
+package business
 
 type istioMetric struct {
 	kialiName      string
@@ -18,11 +18,6 @@ var istioMetrics = []istioMetric{
 		istioName:      "istio_requests_total",
 		isHisto:        false,
 		useErrorLabels: true,
-	},
-	{
-		kialiName: "request_duration",
-		istioName: "istio_request_duration_seconds",
-		isHisto:   true,
 	},
 	{
 		kialiName: "request_duration_millis",

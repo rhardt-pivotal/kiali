@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
@@ -18,17 +19,18 @@ import (
 
 // ClientInterface for mocks (only mocked function are necessary here)
 type ClientInterface interface {
-	FetchHistogramRange(metricName, labels, grouping string, q *BaseMetricsQuery) Histogram
-	FetchRange(metricName, labels, grouping, aggregator string, q *BaseMetricsQuery) *Metric
-	FetchRateRange(metricName, labels, grouping string, q *BaseMetricsQuery) *Metric
+	FetchHistogramRange(metricName, labels, grouping string, q *RangeQuery) Histogram
+	FetchHistogramValues(metricName, labels, grouping, rateInterval string, avg bool, quantiles []string, queryTime time.Time) (map[string]model.Vector, error)
+	FetchRange(metricName, labels, grouping, aggregator string, q *RangeQuery) Metric
+	FetchRateRange(metricName string, labels []string, grouping string, q *RangeQuery) Metric
 	GetAllRequestRates(namespace, ratesInterval string, queryTime time.Time) (model.Vector, error)
 	GetAppRequestRates(namespace, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
 	GetConfiguration() (prom_v1.ConfigResult, error)
 	GetFlags() (prom_v1.FlagsResult, error)
-	GetMetrics(query *IstioMetricsQuery) Metrics
 	GetNamespaceServicesRequestRates(namespace, ratesInterval string, queryTime time.Time) (model.Vector, error)
 	GetServiceRequestRates(namespace, service, ratesInterval string, queryTime time.Time) (model.Vector, error)
 	GetWorkloadRequestRates(namespace, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
+	GetMetricsForLabels(labels []string) ([]string, error)
 }
 
 // Client for Prometheus API.
@@ -39,11 +41,31 @@ type Client struct {
 	api prom_v1.API
 }
 
+var once sync.Once
+var promCache PromCache
+
+func initPromCache() {
+	if config.Get().ExternalServices.Prometheus.CacheEnabled {
+		log.Infof("[Prom Cache] Enabled")
+		promCache = NewPromCache()
+	} else {
+		log.Infof("[Prom Cache] Disabled")
+	}
+}
+
 // NewClient creates a new client to the Prometheus API.
 // It returns an error on any problem.
 func NewClient() (*Client, error) {
-	cfg := config.Get().ExternalServices.Prometheus
+	return NewClientForConfig(config.Get().ExternalServices.Prometheus)
+}
+
+// NewClient creates a new client to the Prometheus API.
+// It returns an error on any problem.
+func NewClientForConfig(cfg config.PrometheusConfig) (*Client, error) {
 	clientConfig := api.Config{Address: cfg.URL}
+
+	// Prom Cache will be initialized once at first use of Prometheus Client
+	once.Do(initPromCache)
 
 	// Be sure to copy config.Auth and not modify the existing
 	auth := cfg.Auth
@@ -78,18 +100,26 @@ func (in *Client) Inject(api prom_v1.API) {
 	in.api = api
 }
 
-// GetMetrics returns the Metrics related to the provided query options.
-func (in *Client) GetMetrics(query *IstioMetricsQuery) Metrics {
-	return getMetrics(in.api, query)
-}
-
 // GetAllRequestRates queries Prometheus to fetch request counter rates, over a time interval, for requests
 // into, internal to, or out of the namespace. Note that it does not discriminate on "reporter", so rates can
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (rates, error)
 func (in *Client) GetAllRequestRates(namespace string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
-	return getAllRequestRates(in.api, namespace, queryTime, ratesInterval)
+	log.Tracef("GetAllRequestRates [namespace: %s] [ratesInterval: %s] [queryTime: %s]", namespace, ratesInterval, queryTime.String())
+	if promCache != nil {
+		if isCached, result := promCache.GetAllRequestRates(namespace, ratesInterval, queryTime); isCached {
+			return result, nil
+		}
+	}
+	result, err := getAllRequestRates(in.api, namespace, queryTime, ratesInterval)
+	if err != nil {
+		return result, err
+	}
+	if promCache != nil {
+		promCache.SetAllRequestRates(namespace, ratesInterval, queryTime, result)
+	}
+	return result, nil
 }
 
 // GetNamespaceServicesRequestRates queries Prometheus to fetch request counter rates, over a time interval, limited to
@@ -98,7 +128,20 @@ func (in *Client) GetAllRequestRates(namespace string, ratesInterval string, que
 // (e.g total rates / error rates).
 // Returns (rates, error)
 func (in *Client) GetNamespaceServicesRequestRates(namespace string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
-	return getNamespaceServicesRequestRates(in.api, namespace, queryTime, ratesInterval)
+	log.Tracef("GetNamespaceServicesRequestRates [namespace: %s] [ratesInterval: %s] [queryTime: %s]", namespace, ratesInterval, queryTime.String())
+	if promCache != nil {
+		if isCached, result := promCache.GetNamespaceServicesRequestRates(namespace, ratesInterval, queryTime); isCached {
+			return result, nil
+		}
+	}
+	result, err := getNamespaceServicesRequestRates(in.api, namespace, queryTime, ratesInterval)
+	if err != nil {
+		return result, err
+	}
+	if promCache != nil {
+		promCache.SetNamespaceServicesRequestRates(namespace, ratesInterval, queryTime, result)
+	}
+	return result, nil
 }
 
 // GetServiceRequestRates queries Prometheus to fetch request counters rates over a time interval
@@ -107,7 +150,20 @@ func (in *Client) GetNamespaceServicesRequestRates(namespace string, ratesInterv
 // (e.g total rates / error rates).
 // Returns (in, error)
 func (in *Client) GetServiceRequestRates(namespace, service, ratesInterval string, queryTime time.Time) (model.Vector, error) {
-	return getServiceRequestRates(in.api, namespace, service, queryTime, ratesInterval)
+	log.Tracef("GetServiceRequestRates [namespace: %s] [service: %s] [ratesInterval: %s] [queryTime: %s]", namespace, service, ratesInterval, queryTime.String())
+	if promCache != nil {
+		if isCached, result := promCache.GetServiceRequestRates(namespace, service, ratesInterval, queryTime); isCached {
+			return result, nil
+		}
+	}
+	result, err := getServiceRequestRates(in.api, namespace, service, queryTime, ratesInterval)
+	if err != nil {
+		return result, err
+	}
+	if promCache != nil {
+		promCache.SetServiceRequestRates(namespace, service, ratesInterval, queryTime, result)
+	}
+	return result, nil
 }
 
 // GetAppRequestRates queries Prometheus to fetch request counters rates over a time interval
@@ -116,7 +172,20 @@ func (in *Client) GetServiceRequestRates(namespace, service, ratesInterval strin
 // (e.g total rates / error rates).
 // Returns (in, out, error)
 func (in *Client) GetAppRequestRates(namespace, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
-	return getItemRequestRates(in.api, namespace, app, "app", queryTime, ratesInterval)
+	log.Tracef("GetAppRequestRates [namespace: %s] [app: %s] [ratesInterval: %s] [queryTime: %s]", namespace, app, ratesInterval, queryTime.String())
+	if promCache != nil {
+		if isCached, inResult, outResult := promCache.GetAppRequestRates(namespace, app, ratesInterval, queryTime); isCached {
+			return inResult, outResult, nil
+		}
+	}
+	inResult, outResult, err := getItemRequestRates(in.api, namespace, app, "app", queryTime, ratesInterval)
+	if err != nil {
+		return inResult, outResult, err
+	}
+	if promCache != nil {
+		promCache.SetAppRequestRates(namespace, app, ratesInterval, queryTime, inResult, outResult)
+	}
+	return inResult, outResult, nil
 }
 
 // GetWorkloadRequestRates queries Prometheus to fetch request counters rates over a time interval
@@ -125,11 +194,24 @@ func (in *Client) GetAppRequestRates(namespace, app, ratesInterval string, query
 // (e.g total rates / error rates).
 // Returns (in, out, error)
 func (in *Client) GetWorkloadRequestRates(namespace, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
-	return getItemRequestRates(in.api, namespace, workload, "workload", queryTime, ratesInterval)
+	log.Tracef("GetWorkloadRequestRates [namespace: %s] [workload: %s] [ratesInterval: %s] [queryTime: %s]", namespace, workload, ratesInterval, queryTime.String())
+	if promCache != nil {
+		if isCached, inResult, outResult := promCache.GetWorkloadRequestRates(namespace, workload, ratesInterval, queryTime); isCached {
+			return inResult, outResult, nil
+		}
+	}
+	inResult, outResult, err := getItemRequestRates(in.api, namespace, workload, "workload", queryTime, ratesInterval)
+	if err != nil {
+		return inResult, outResult, err
+	}
+	if promCache != nil {
+		promCache.SetWorkloadRequestRates(namespace, workload, ratesInterval, queryTime, inResult, outResult)
+	}
+	return inResult, outResult, nil
 }
 
 // FetchRange fetches a simple metric (gauge or counter) in given range
-func (in *Client) FetchRange(metricName, labels, grouping, aggregator string, q *BaseMetricsQuery) *Metric {
+func (in *Client) FetchRange(metricName, labels, grouping, aggregator string, q *RangeQuery) Metric {
 	query := fmt.Sprintf("%s(%s%s)", aggregator, metricName, labels)
 	if grouping != "" {
 		query += fmt.Sprintf(" by (%s)", grouping)
@@ -139,13 +221,18 @@ func (in *Client) FetchRange(metricName, labels, grouping, aggregator string, q 
 }
 
 // FetchRateRange fetches a counter's rate in given range
-func (in *Client) FetchRateRange(metricName, labels, grouping string, q *BaseMetricsQuery) *Metric {
-	return fetchRateRange(in.api, metricName, []string{labels}, grouping, q)
+func (in *Client) FetchRateRange(metricName string, labels []string, grouping string, q *RangeQuery) Metric {
+	return fetchRateRange(in.api, metricName, labels, grouping, q)
 }
 
 // FetchHistogramRange fetches bucketed metric as histogram in given range
-func (in *Client) FetchHistogramRange(metricName, labels, grouping string, q *BaseMetricsQuery) Histogram {
+func (in *Client) FetchHistogramRange(metricName, labels, grouping string, q *RangeQuery) Histogram {
 	return fetchHistogramRange(in.api, metricName, labels, grouping, q)
+}
+
+// FetchHistogramValues fetches bucketed metric as histogram at a given specific time
+func (in *Client) FetchHistogramValues(metricName, labels, grouping, rateInterval string, avg bool, quantiles []string, queryTime time.Time) (map[string]model.Vector, error) {
+	return fetchHistogramValues(in.api, metricName, labels, grouping, rateInterval, avg, quantiles, queryTime)
 }
 
 // API returns the Prometheus V1 HTTP API for performing calls not supported natively by this client
@@ -172,4 +259,22 @@ func (in *Client) GetFlags() (prom_v1.FlagsResult, error) {
 		return nil, err
 	}
 	return flags, nil
+}
+
+// GetMetricsForLabels returns a list of metrics existing for the provided labels set
+func (in *Client) GetMetricsForLabels(labels []string) ([]string, error) {
+	// Arbitrarily set time range. Meaning that discovery works with metrics produced within last hour
+	end := time.Now()
+	start := end.Add(-time.Hour)
+	results, err := in.api.Series(context.Background(), labels, start, end)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, labelSet := range results {
+		if name, ok := labelSet["__name__"]; ok {
+			names = append(names, string(name))
+		}
+	}
+	return names, nil
 }

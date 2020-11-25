@@ -3,7 +3,7 @@
 #
 
 .ensure-operator-is-running: .ensure-oc-exists
-	@${OC} get pods -l app=kiali-operator -n kiali-operator 2>/dev/null | grep "^kiali-operator.*Running" > /dev/null ;\
+	@${OC} get pods -l app.kubernetes.io/name=kiali-operator -n kiali-operator 2>/dev/null | grep "^kiali-operator.*Running" > /dev/null ;\
 	RETVAL=$$?; \
 	if [ $$RETVAL -ne 0 ]; then \
 	  echo "The Operator is not running. Cannot continue."; exit 1; \
@@ -69,30 +69,36 @@ ISTIO_NAMESPACE="${ISTIO_NAMESPACE}" \
 NAMESPACE="${NAMESPACE}" \
 ROUTER_HOSTNAME="$(shell ${OC} get $(shell (${OC} get routes -n ${NAMESPACE} -o name 2>/dev/null || echo 'noroute') | head -n 1) -n ${NAMESPACE} -o jsonpath='{.status.ingress[0].routerCanonicalHostname}' 2>/dev/null)" \
 SERVICE_TYPE="${SERVICE_TYPE}" \
-VERBOSE_MODE="${VERBOSE_MODE}" \
 KIALI_CR_SPEC_VERSION="${KIALI_CR_SPEC_VERSION}" \
 envsubst | ${OC} apply -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" -f -
+ifeq ($(IS_MAISTRA),true)
+	@echo "Deploying within a Maistra environment - create network policy to enable access to the Kiali UI"
+	@echo '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"labels":{"app.kubernetes.io/name":"kiali"},"name":"kiali-network-policy-from-make"},"spec":{"ingress":[{}],"podSelector":{"matchLabels":{"app":"kiali"}},"policyTypes":["Ingress"]}}' | ${OC} apply -n ${NAMESPACE} -f -
+endif
 
 ## kiali-delete: Remove a Kiali CR from the cluster, informing the Kiali operator to uninstall Kiali.
 kiali-delete: .ensure-oc-exists
 	@echo Remove Kiali
 	${OC} delete --ignore-not-found=true kiali kiali -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" ; true
+	@echo "Remove NetworkPolicy if it exists (was only created within Maistra environment)"
+	${OC} delete --ignore-not-found=true networkpolicies.networking.k8s.io -n ${NAMESPACE} kiali-network-policy-from-make
 
 ## kiali-purge: Purges all Kiali resources directly without going through the operator or ansible.
 kiali-purge: .ensure-oc-exists
 	@echo Purge Kiali resources
 	${OC} patch kiali kiali -n "${OPERATOR_INSTALL_KIALI_CR_NAMESPACE}" -p '{"metadata":{"finalizers": []}}' --type=merge ; true
-	${OC} delete --ignore-not-found=true all,secrets,sa,configmaps,deployments,roles,rolebindings,ingresses --selector="app=kiali" -n "${NAMESPACE}"
-	${OC} delete --ignore-not-found=true clusterroles,clusterrolebindings --selector="app=kiali"
+	${OC} delete --ignore-not-found=true all,secrets,sa,configmaps,deployments,roles,rolebindings,ingresses --selector="app.kubernetes.io/name=kiali" -n "${NAMESPACE}"
+	${OC} delete --ignore-not-found=true clusterroles,clusterrolebindings --selector="app.kubernetes.io/name=kiali"
+	${OC} delete --ignore-not-found=true networkpolicies.networking.k8s.io -n ${NAMESPACE} kiali-network-policy-from-make
 ifeq ($(CLUSTER_TYPE),openshift)
-	${OC} delete --ignore-not-found=true routes --selector="app=kiali" -n "${NAMESPACE}" ; true
-	${OC} delete --ignore-not-found=true consolelinks.console.openshift.io,oauthclients.oauth.openshift.io --selector="app=kiali" ; true
+	${OC} delete --ignore-not-found=true routes --selector="app.kubernetes.io/name=kiali" -n "${NAMESPACE}" ; true
+	${OC} delete --ignore-not-found=true consolelinks.console.openshift.io,oauthclients.oauth.openshift.io --selector="app.kubernetes.io/name=kiali" ; true
 endif
 
 ## kiali-reload-image: Refreshing the Kiali pod by deleting it which forces a redeployment
 kiali-reload-image: .ensure-oc-exists
 	@echo Refreshing Kiali pod within namespace ${NAMESPACE}
-	${OC} delete pod --selector=app=kiali -n ${NAMESPACE}
+	${OC} delete pod --selector=app.kubernetes.io/name=kiali -n ${NAMESPACE}
 
 ## run-operator-playbook: Run the operator dev playbook to run the operator ansible script locally.
 run-operator-playbook: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists

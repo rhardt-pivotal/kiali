@@ -5,9 +5,12 @@ SHELL=/bin/bash
 ROOTDIR=$(CURDIR)
 OUTDIR=${ROOTDIR}/_output
 
+# list for multi-arch image publishing
+TARGET_ARCHS ?= amd64 arm64 s390x ppc64le
+
 # Identifies the current build.
 # These will be embedded in the app and displayed when it starts.
-VERSION ?= v1.26.0-SNAPSHOT
+VERSION ?= v1.28.0-SNAPSHOT
 COMMIT_HASH ?= $(shell git rev-parse HEAD)
 
 # Indicates which version of the UI console is to be embedded
@@ -22,7 +25,7 @@ CONSOLE_LOCAL_DIR ?= ${ROOTDIR}/../../../../../kiali-ui
 
 # Version label is used in the OpenShift/K8S resources to identify
 # their specific instances. Kiali resources will have labels of
-# "app: kiali" and "version: ${VERSION_LABEL}"
+# "app.kubernetes.io/name: kiali" and "app.kubernetes.io/version: ${VERSION_LABEL}"
 # The default is the VERSION itself.
 VERSION_LABEL ?= ${VERSION}
 
@@ -40,13 +43,13 @@ CONTAINER_VERSION ?= dev
 
 # These two vars allow Jenkins to override values.
 QUAY_NAME ?= quay.io/${CONTAINER_NAME}
-QUAY_TAG = ${QUAY_NAME}:${CONTAINER_VERSION}
+QUAY_TAG ?= ${QUAY_NAME}:${CONTAINER_VERSION}
 
 # Identifies the Kiali operator container images that will be built
 OPERATOR_CONTAINER_NAME ?= ${IMAGE_ORG}/kiali-operator
 OPERATOR_CONTAINER_VERSION ?= ${CONTAINER_VERSION}
 OPERATOR_QUAY_NAME ?= quay.io/${OPERATOR_CONTAINER_NAME}
-OPERATOR_QUAY_TAG = ${OPERATOR_QUAY_NAME}:${OPERATOR_CONTAINER_VERSION}
+OPERATOR_QUAY_TAG ?= ${OPERATOR_QUAY_NAME}:${OPERATOR_CONTAINER_VERSION}
 
 # Where the control plane is
 ISTIO_NAMESPACE ?= istio-system
@@ -110,7 +113,6 @@ AUTH_STRATEGY ?= openshift
 endif
 KIALI_IMAGE_PULL_POLICY ?= Always
 SERVICE_TYPE ?= ClusterIP
-VERBOSE_MODE ?= 3
 KIALI_CR_SPEC_VERSION ?= default
 
 # Determine if Maistra/ServiceMesh is deployed. If not, assume we are working with upstream Istio.

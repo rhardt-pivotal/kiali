@@ -7,7 +7,7 @@ clean:
 	@echo Cleaning...
 	@rm -f kiali
 	@rm -rf ${GOPATH}/bin/kiali
-	@[ -d ${GOPATH}/pkg/* ] && chmod -R +rw ${GOPATH}/pkg/* || true
+	@[ -d ${GOPATH}/pkg ] && chmod -R +rw ${GOPATH}/pkg/* || true
 	@rm -rf ${GOPATH}/pkg/*
 	@rm -rf ${OUTDIR}/docker
 
@@ -24,6 +24,14 @@ build: go-check
 	@echo Building...
 	${GO_BUILD_ENVVARS} ${GO} build \
 		-o ${GOPATH}/bin/kiali -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"
+
+## build-linux-multi-arch: Build Kiali binary with arch suffix for multi-arch
+build-linux-multi-arch:
+	@for arch in ${TARGET_ARCHS}; do \
+		echo "Building for architecture [$${arch}]"; \
+		${GO_BUILD_ENVVARS} GOOS=linux GOARCH=$${arch} ${GO} build \
+			-o ${GOPATH}/bin/kiali-$${arch} -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"; \
+	done
 
 ## install: Install missing dependencies. Runs `go install` internally
 install:
@@ -78,7 +86,7 @@ test-e2e:
 ## run: Run kiali binary
 run:
 	@echo Running...
-	@${GOPATH}/bin/kiali -v 4 -config config.yaml
+	@LOG_LEVEL="debug" ${GOPATH}/bin/kiali -config config.yaml
 
 #
 # Swagger Documentation

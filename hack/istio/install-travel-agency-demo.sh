@@ -35,8 +35,8 @@ Valid command line arguments:
   -c|--client: either 'oc' or 'kubectl'
   -d|--delete: either 'true' or 'false'. If 'true' the travel agency demo will be deleted, not installed.
   -eo|--enable-operation-metrics: either 'true' or 'false' (default is false). Only works on Istio 1.7 installed in istio-system.
-  -iv|--install-version: either 'v1' or 'v2' (default is v1)
   -sg|--show-gui: do not install anything, but bring up the travel agency GUI in a browser window
+  -h|--help: this text
 HELPMSG
       exit 1
       ;;

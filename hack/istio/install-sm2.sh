@@ -1,9 +1,9 @@
 #!/bin/bash
 
 ##############################################################################
-# install-sm10.sh
+# install-sm2
 #
-# Run this script to install Service Mesh 1.0.
+# Run this script to install Service Mesh 2.x.
 #
 # This script takes one command whose value is one of the following:
 #   sm-install: installs service mesh into the cluster
@@ -51,27 +51,6 @@ get_downloader() {
   debug "Downloader command to be used: ${DOWNLOADER}"
 }
 
-get_registry_names() {
-  local ext=$(${OC} get image.config.openshift.io/cluster -o custom-columns=EXT:.status.externalRegistryHostnames[0] --no-headers 2>/dev/null)
-  local int=$(${OC} get image.config.openshift.io/cluster -o custom-columns=INT:.status.internalRegistryHostname --no-headers 2>/dev/null)
-  EXTERNAL_IMAGE_REGISTRY=${ext:-<unknown>}
-  INTERNAL_IMAGE_REGISTRY=${int:-<unknown>}
-}
-
-get_route_url() {
-  # takes as input "routeName:routeNamespace"
-  local routename=$(echo ${1} | cut -d: -f1)
-  local routenamespace=$(echo ${1} | cut -d: -f2)
-  local protocol="https"
-  local termination=$(${OC} get route ${routename} -n ${routenamespace} -o custom-columns=T:spec.tls.termination --no-headers)
-  if [ "${termination}" == "<none>" ]; then
-    protocol="http"
-  fi
-  local host=$(${OC} get route ${routename} -n ${routenamespace} -o custom-columns=H:spec.host --no-headers)
-
-  ROUTE_URL="${protocol}://${host}"
-}
-
 check_istio_app() {
   local expected="$1"
   apps=$(${OC} get deployment.apps -n ${CONTROL_PLANE_NAMESPACE} -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2> /dev/null)
@@ -84,22 +63,123 @@ check_istio_app() {
   return 1
 }
 
+apply_smcp() {
+  while ! ${OC} apply -n ${1} -f ${2}
+  do
+    warnmsg "Failed to apply SMCP [${2}] - will retry in 5 seconds to see if the error condition clears up..."
+    sleep 5
+  done
+  infomsg "SMCP [${2}] has been successfully applied to namespace [${1}]."
+}
+
 install_service_mesh() {
+
+  OPENSHIFT_MAJOR_MINOR_VERSION="$(${OC} version | grep "Server" | sed 's/.*\([[:digit:]]\+\.[[:digit:]]\+\)\.[[:digit:]]\+/\1/')"
+
+  # START CODE THAT IS NECESSARY TO PULL CONTENT FROM PRIVATE MAISTRA QUAY REPO
+  if [ "${USE_QUAY}" == "true" ]; then
+
+    if ${OC} get namespace registry-puller; then
+      echo "registry-puller seems to be installed. Good."
+    else
+      echo "It appears you do not have the registry-puller installed. That must be installed. Aborting."
+      exit 1
+    fi
+
+    # Disable all other Operator Sources - we probably don't need to do this
+    ${OC} patch operatorhub cluster -n openshift-marketplace -p '{"spec":{"disableAllDefaultSources": true}}' --type=merge
+
+    if ${OC} get secret sm-pull-secret -n openshift-marketplace; then
+      echo "Operator source secret already created"
+    else
+      # Get the quay token that has access to the private maistra quay.io repo
+      echo -n 'Your quay.io username: ' && read QUAY_USERNAME && echo -n 'Your quay.io password: ' && export QUAY_TOKEN=$(curl --silent -H "Content-Type: application/json" -XPOST https://quay.io/cnr/api/v1/users/login -d '{"user":{"username":"'"${QUAY_USERNAME}"'","password":"'"$(read -s PW && echo -n $PW)"'"}}' | sed -E 's/.*\"(basic .*)\".*/\1/')
+
+      # create operator source secret used to get content from private maistra quay repo
+      cat <<EOM1 | ${OC} apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sm-pull-secret
+  namespace: openshift-marketplace
+stringData:
+  token: "$QUAY_TOKEN"
+EOM1
+    fi
+
+    # create operator source to get private maistra content
+    OPERATOR_SOURCE_NAME="maistra-redhat-operators"
+    cat <<EOM2 | ${OC} apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorSource
+metadata:
+  name: $OPERATOR_SOURCE_NAME
+  namespace: openshift-marketplace
+spec:
+  type: appregistry
+  endpoint: https://quay.io/cnr
+  registryNamespace: maistra
+  displayName: "Maistra Operators"
+  publisher: "Maistra Team"
+  authorizationToken:
+    secretName: sm-pull-secret
+EOM2
+  fi
+  # END CODE THAT IS NECESSARY TO PULL CONTENT FROM PRIVATE MAISTRA QUAY REPO
+
   local create_smcp="$1"
-  infomsg "Installing the Service Mesh operator..."
+  OPERATOR_SOURCE_NAME=${OPERATOR_SOURCE_NAME:-redhat-operators}
+  infomsg "Installing the Service Mesh operators..."
   cat <<EOM | ${OC} apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: elasticsearch-operator
+  namespace: openshift-operators
+spec:
+  channel: "${OPENSHIFT_MAJOR_MINOR_VERSION}"
+  installPlanApproval: Automatic
+  name: elasticsearch-operator
+  source: $OPERATOR_SOURCE_NAME
+  sourceNamespace: openshift-marketplace
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: jaeger-product
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: jaeger-product
+  source: $OPERATOR_SOURCE_NAME
+  sourceNamespace: openshift-marketplace
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: kiali-ossm
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: kiali-ossm
+  source: $OPERATOR_SOURCE_NAME
+  sourceNamespace: openshift-marketplace
+---
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
   name: servicemeshoperator
   namespace: openshift-operators
 spec:
-  channel: '1.0'
+  channel: stable
   installPlanApproval: Automatic
   name: servicemeshoperator
-  source: redhat-operators
+  source: $OPERATOR_SOURCE_NAME
   sourceNamespace: openshift-marketplace
 EOM
+
   if [ "${create_smcp}" == "true" ] ; then
 
     infomsg "Waiting for the operator CRDs to come online"
@@ -157,15 +237,43 @@ EOM
 
     infomsg "Creating control plane namespace: ${CONTROL_PLANE_NAMESPACE}"
     ${OC} create namespace ${CONTROL_PLANE_NAMESPACE}
+
+    infomsg "Wait for the servicemesh validating webhook to be created."
+    while [ "$(${OC} get validatingwebhookconfigurations -o name | grep servicemesh)" == "" ]
+    do
+      echo -n "."
+      sleep 5
+    done
+    echo "done."
+
+    infomsg "Wait for the servicemesh mutating webhook to be created."
+    while [ "$(${OC} get mutatingwebhookconfigurations -o name | grep servicemesh)" == "" ]
+    do
+      echo -n "."
+      sleep 5
+    done
+    echo "done."
+
     infomsg "Installing Maistra via ServiceMeshControlPlane Custom Resource."
     if [ "${MAISTRA_SMCP_YAML}" != "" ]; then
-      ${OC} create -n ${CONTROL_PLANE_NAMESPACE} -f ${MAISTRA_SMCP_YAML}
+      apply_smcp "${CONTROL_PLANE_NAMESPACE}" "${MAISTRA_SMCP_YAML}"
     else
       debug "Using example SMCP/SMMR"
       rm -f /tmp/maistra-smcp.yaml
       get_downloader
-      eval ${DOWNLOADER} /tmp/maistra-smcp.yaml "https://raw.githubusercontent.com/Maistra/istio-operator/maistra-1.0/deploy/examples/maistra_v1_servicemeshcontrolplane_cr_full.yaml"
-      ${OC} create -n ${CONTROL_PLANE_NAMESPACE} -f /tmp/maistra-smcp.yaml
+      eval ${DOWNLOADER} /tmp/maistra-smcp.yaml "https://raw.githubusercontent.com/Maistra/istio-operator/maistra-2.0/deploy/examples/maistra_v2_servicemeshcontrolplane_cr_full.yaml"
+
+      # The example we just downloaded doesn't specify a version. We could set it explicitly to v2.0
+      # but the webhook will set the value to v2.0 for us automagically.
+      #sed -i 's/istio:/version: v2.0\n  istio:/' /tmp/maistra-smcp.yaml
+
+      apply_smcp "${CONTROL_PLANE_NAMESPACE}" "/tmp/maistra-smcp.yaml"
+
+      # START CODE THAT IS NECESSARY TO PULL CONTENT FROM PRIVATE MAISTRA QUAY REPO
+      if [ "${USE_QUAY}" == "true" ]; then
+        ${OC} patch smcp full-install -n ${CONTROL_PLANE_NAMESPACE} -p '{"spec": {"istio": {"global": {"tag": "2.0.0", "hub":"quay.io/maistra"}}}}' --type=merge
+      fi
+      # END CODE THAT IS NECESSARY TO PULL CONTENT FROM PRIVATE MAISTRA QUAY REPO
     fi
   else
     infomsg "The operators should be available but the Maistra SMCP CR will not be created."
@@ -242,7 +350,10 @@ while [[ $# -gt 0 ]]; do
       MAISTRA_SMCP_YAML="$2"
       shift;shift
       ;;
-
+    -uq|--use-quay)
+      USE_QUAY="$2"
+      shift;shift
+      ;;
     # HELP
 
     -h|--help)
@@ -272,6 +383,10 @@ Valid options that configure the service mesh components:
   -smcp|--maistra-smcp-yaml <file or url>
       Points to the YAML file that defines the ServiceMeshControlPlane custom resource which declares what to install.
       If not defined, a basic one will be used.
+  -uq|--use-quay <true|false>
+      If true, perform additional things so the images are pulled from quay.io rather than registry.redhat.io.
+      You can only use this if you have been granted access to the pre-release quay.io repository for Maistra images.
+      Default: false
 
 The command must be one of:
 
@@ -338,8 +453,8 @@ if [ "$_CMD" = "sm-install" ]; then
   if [ "${WAIT_FOR_ISTIO}" == "true" ]; then
     infomsg "Wait for Maistra to fully start (this is going to take a while)..."
 
-    infomsg "Waiting for Maistra Deployments to be created."
-    _EXPECTED_APPS=(istio-citadel prometheus istio-galley istio-policy istio-telemetry istio-pilot istio-egressgateway istio-ingressgateway istio-sidecar-injector)
+    infomsg "Waiting for Maistra Deployments to be created. NOTE: this assumes the SMCP is called 'full'"
+    _EXPECTED_APPS=(istiod-full prometheus istio-egressgateway istio-ingressgateway)
     for expected in ${_EXPECTED_APPS[@]}
     do
       echo -n "Waiting for $expected ..."
@@ -368,43 +483,44 @@ if [ "$_CMD" = "sm-install" ]; then
 
 elif [ "$_CMD" = "sm-uninstall" ]; then
 
-  # remove the SMCP and SMMR CRs which uninstalls all the Service Mesh components
-  debug "Deleting the ServiceMesh SMCP and SMMR CRs"
+  infomsg "Delete the ServiceMesh SMCP and SMMR CRs (if they exist) which uninstalls all the Service Mesh components"
   ${OC} delete -n ${CONTROL_PLANE_NAMESPACE} $(${OC} get smcp -n ${CONTROL_PLANE_NAMESPACE} -o name)
   ${OC} delete -n ${CONTROL_PLANE_NAMESPACE} $(${OC} get smmr -n ${CONTROL_PLANE_NAMESPACE} -o name)
 
-  # Make sure the Kiail CR is deleted (probably not needed, ServiceMesh should be doing this)
+  infomsg "Make sure the Kiail CR is deleted (probably not needed, ServiceMesh should be doing this)"
   _kialicr=$(${OC} get kiali -n ${CONTROL_PLANE_NAMESPACE} -o name 2>/dev/null)
   if [ "${_kialicr}" != "" ]; then
     debug "Deleting the Kiali CR"
-    ${OC} patch ${_kialicr} -n ${CONTROL_PLANE_NAMESPACE} -p '{"metadata":{"finalizers": []}}' --type=merge
+    #${OC} patch ${_kialicr} -n ${CONTROL_PLANE_NAMESPACE} -p '{"metadata":{"finalizers": []}}' --type=merge
     ${OC} delete ${_kialicr} -n ${CONTROL_PLANE_NAMESPACE}
   fi
 
-  debug "Cleaning up the rest of ServiceMesh"
+  infomsg "Cleaning up the rest of ServiceMesh"
 
-  # clean up the control plane namespace
+  debug "Clean up the control plane namespace [${CONTROL_PLANE_NAMESPACE}]"
   ${OC} delete namespace ${CONTROL_PLANE_NAMESPACE}
 
-  # clean up OLM Subscriptions
+  debug "Clean up OLM Subscriptions"
   for sub in $(${OC} get subscriptions -n openshift-operators -o name | grep -E 'servicemesh|kiali|jaeger|elasticsearch')
   do
     ${OC} delete -n openshift-operators ${sub}
   done
 
-  # clean up OLM CSVs for all the different operators which deletes the operators and their related resources
+  debug "Clean up OLM CSVs for all the different operators which deletes the operators and their related resources"
   for csv in $(${OC} get csv --all-namespaces --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name | sed ${SEDOPTIONS} 's/  */:/g' | grep -E 'servicemesh|kiali|jaeger|elasticsearch')
   do
     ${OC} delete csv -n $(echo -n $csv | cut -d: -f1) $(echo -n $csv | cut -d: -f2)
   done
 
-  # Delete Istio resources that are getting left behind for some reason
+  debug "Delete Istio clusterroles/bindings that are getting left behind"
   for r in \
     $(${OC} get clusterrolebindings -o name | grep -E 'istio') \
     $(${OC} get clusterroles -o name | grep -E 'istio')
   do
     ${OC} delete ${r}
   done
+
+  debug "Delete Istio service accounts, configmaps, secrets that are getting left behind"
   for r in \
     $(${OC} get sa -n openshift-operators -o name | grep -E 'istio') \
     $(${OC} get configmaps -n openshift-operators -o name | grep -E 'istio') \
@@ -413,11 +529,21 @@ elif [ "$_CMD" = "sm-uninstall" ]; then
     ${OC} delete -n openshift-operators ${r}
   done
 
-  # clean up additional leftover items
   # see: https://docs.openshift.com/container-platform/4.1/service_mesh/service_mesh_install/removing-ossm.html#ossm-remove-cleanup_removing-ossm
+  debug "Clean up validating webhooks"
   ${OC} delete validatingwebhookconfiguration/openshift-operators.servicemesh-resources.maistra.io
+  ${OC} delete validatingwebhookconfiguration/istiod-istio-system
+  debug "Clean up mutating webhooks"
+  ${OC} delete mutatingwebhookconfigurations/openshift-operators.servicemesh-resources.maistra.io
+  ${OC} delete mutatingwebhookconfigurations/istio-sidecar-injector
+  debug "Clean up deamonsets"
   ${OC} delete -n openshift-operators daemonset/istio-node
-  ${OC} delete clusterrole/istio-admin
+  debug "Clean up some more clusterroles/bindings"
+  ${OC} delete clusterrole/istio-admin clusterrole/istio-cni clusterrolebinding/istio-cni
+  debug "Clean up some security related things from the operator"
+  ${OC} delete -n openshift-operators configmap/maistra-operator-cabundle
+  ${OC} delete -n openshift-operators secret/maistra-operator-serving-cert
+  debug "Delete the CRDs"
   ${OC} get crds -o name | grep '.*\.istio\.io' | xargs -r -n 1 ${OC} delete
   ${OC} get crds -o name | grep '.*\.maistra\.io' | xargs -r -n 1 ${OC} delete
   ${OC} get crds -o name | grep '.*\.kiali\.io' | xargs -r -n 1 ${OC} delete
@@ -431,8 +557,8 @@ elif [ "$_CMD" = "bi-install" ]; then
   # see: https://maistra.io/docs/examples/bookinfo/
   ${OC} new-project ${BOOKINFO_NAMESPACE}
   ${OC} patch -n ${CONTROL_PLANE_NAMESPACE} --type='json' smmr default -p '[{"op": "add", "path": "/spec/members", "value":["'"${BOOKINFO_NAMESPACE}"'"]}]'
-  ${OC} apply -n ${BOOKINFO_NAMESPACE} -f https://raw.githubusercontent.com/Maistra/bookinfo/maistra-1.0/bookinfo.yaml
-  ${OC} apply -n ${BOOKINFO_NAMESPACE} -f https://raw.githubusercontent.com/Maistra/bookinfo/maistra-1.0/bookinfo-gateway.yaml
+  ${OC} apply -n ${BOOKINFO_NAMESPACE} -f https://raw.githubusercontent.com/maistra/istio/maistra-2.0/samples/bookinfo/platform/kube/bookinfo.yaml
+  ${OC} apply -n ${BOOKINFO_NAMESPACE} -f https://raw.githubusercontent.com/maistra/istio/maistra-2.0/samples/bookinfo/platform/kube/bookinfo-ingress.yaml
 
   BOOKINFO_PRODUCTPAGE_URL="http://$(${OC} get route istio-ingressgateway -n ${CONTROL_PLANE_NAMESPACE} -o jsonpath='{.spec.host}')/productpage"
   infomsg "Bookinfo URL: ${BOOKINFO_PRODUCTPAGE_URL}"
@@ -446,31 +572,39 @@ elif [ "$_CMD" = "k-uninstall" ]; then
   # Tell ServiceMesh to disable Kiali so it doesn't try to manage it
   _smcp=$(${OC} get smcp -n ${CONTROL_PLANE_NAMESPACE} -o name 2>/dev/null)
   if [ "${_smcp}" != "" ]; then
-    debug "Telling ServiceMesh to disable Kiali"
-    ${OC} patch ${_smcp} -n ${CONTROL_PLANE_NAMESPACE} -p '{"spec":{"istio":{"kiali":{"enabled": "false"}}}}' --type=merge
+    infomsg "Telling ServiceMesh to disable Kiali"
+    ${OC} patch ${_smcp} -n ${CONTROL_PLANE_NAMESPACE} -p '{"spec":{"addons":{"kiali":{"enabled": false}}}}' --type=merge
   fi
 
   # Make sure the Kiail CR is deleted (probably not needed, ServiceMesh should be doing this)
   _kialicr=$(${OC} get kiali -n ${CONTROL_PLANE_NAMESPACE} -o name 2>/dev/null)
   if [ "${_kialicr}" != "" ]; then
-    debug "Deleting the Kiali CR"
+    infomsg "Deleting the Kiali CR"
     ${OC} patch ${_kialicr} -n ${CONTROL_PLANE_NAMESPACE} -p '{"metadata":{"finalizers": []}}' --type=merge
     ${OC} delete ${_kialicr} -n ${CONTROL_PLANE_NAMESPACE}
   fi
 
-  # clean up OLM subscriptions
+  infomsg "Waiting for Kiali CR to disappear..."
+  _kialicr=$(${OC} get kiali -n ${CONTROL_PLANE_NAMESPACE} -o name 2>/dev/null)
+  while [ "${kiali_deployment}" != "" ]
+  do
+    sleep 2
+    _kialicr=$(${OC} get kiali -n ${CONTROL_PLANE_NAMESPACE} -o name 2>/dev/null)
+  done
+
+  infomsg "Delete OLM subscriptions"
   for sub in $(${OC} get subscriptions -n openshift-operators -o name | grep kiali)
   do
     ${OC} delete -n openshift-operators ${sub}
   done
 
-  # clean up OLM CSVs which deletes the operator and its related resources
-  for csv in $(${OC} get csv --all-namespaces --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name | sed ${SEDOPTIONS} 's/  */:/g' | grep kiali)
+  infomsg "Delete OLM CSVs which deletes the operator and its related resources"
+  for csv in $(${OC} get csv --all-namespaces --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name | sed ${SEDOPTIONS} 's/  */:/g' | grep kiali-operator)
   do
     ${OC} delete csv -n $(echo -n $csv | cut -d: -f1) $(echo -n $csv | cut -d: -f2)
   done
 
-  # clean up additional leftover items
+  infomsg "Delete Kiali CRDs"
   ${OC} get crds -o name | grep '.*\.kiali\.io' | xargs -r -n 1 ${OC} delete
 
 else

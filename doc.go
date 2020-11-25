@@ -2,14 +2,12 @@ package main
 
 import (
 	jaegerModels "github.com/jaegertracing/jaeger/model/json"
-	"github.com/kiali/k-charted/model"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/graph/config/cytoscape"
 	"github.com/kiali/kiali/handlers"
 	"github.com/kiali/kiali/jaeger"
 	"github.com/kiali/kiali/models"
-	"github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/status"
 )
 
@@ -125,6 +123,16 @@ type SinceTimeParam struct {
 	// in: query
 	// required: false
 	Name string `json:"sinceTime"`
+}
+
+// swagger:parameters podLogs
+type DurationLogParam struct {
+	// Query time-range duration (Golang string duration). Duration starts on
+	// `sinceTime` if set, or the time for the first log message if not set.
+	//
+	// in: query
+	// required: false
+	Name string `json:"duration"`
 }
 
 // swagger:parameters traceDetails
@@ -581,14 +589,14 @@ type WorkloadDetailsResponse struct {
 // swagger:response metricsResponse
 type MetricsResponse struct {
 	// in:body
-	Body prometheus.Metrics
+	Body models.MetricsMap
 }
 
 // Dashboard response model
 // swagger:response dashboardResponse
 type DashboardResponse struct {
 	// in:body
-	Body model.MonitoringDashboard
+	Body models.MonitoringDashboard
 }
 
 // IstioConfig details of an specific Istio Object
@@ -699,4 +707,18 @@ type Iter8ExperimentsResponnse struct {
 type IstioStatusResponse struct {
 	// in: body
 	Body business.IstioComponentStatus
+}
+
+// Posted parameters for a metrics stats query
+// swagger:parameters metricsStats
+type MetricsStatsQueryBody struct {
+	// in: body
+	Body models.MetricsStatsQueries
+}
+
+// Response of the metrics stats query
+// swagger:response metricsStatsResponse
+type MetricsStatsResponse struct {
+	// in: body
+	Body models.MetricsStats
 }

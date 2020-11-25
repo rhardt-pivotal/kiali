@@ -24,11 +24,16 @@ func HttpGet(url string, auth *config.Auth, timeout time.Duration) ([]byte, int,
 	if err != nil {
 		return nil, 0, err
 	}
-	transport, err := AuthTransport(auth, &http.Transport{})
-	if err != nil {
-		return nil, 0, err
+	var client http.Client
+	if auth != nil {
+		transport, err := AuthTransport(auth, &http.Transport{})
+		if err != nil {
+			return nil, 0, err
+		}
+		client = http.Client{Transport: transport, Timeout: timeout}
+	} else {
+		client = http.Client{Timeout: timeout}
 	}
-	client := http.Client{Transport: transport, Timeout: timeout}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -126,7 +131,9 @@ func GuessKialiURL(r *http.Request) string {
 	// priority, because this is the port where the pod is listening, which may
 	// be mapped to another public port via the Service/Ingress. So, HTTP headers
 	// take priority.
-	if fwdPort, ok := r.Header["X-Forwarded-Port"]; ok && len(fwdPort) == 1 {
+	if len(cfg.Server.WebPort) > 0 {
+		port = cfg.Server.WebPort
+	} else if fwdPort, ok := r.Header["X-Forwarded-Port"]; ok && len(fwdPort) == 1 {
 		port = fwdPort[0]
 	} else if len(r.URL.Host) != 0 {
 		if len(r.URL.Port()) != 0 {

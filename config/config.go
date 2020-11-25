@@ -72,6 +72,7 @@ type Server struct {
 	Port                       int    `yaml:",omitempty"`
 	StaticContentRootDirectory string `yaml:"static_content_root_directory,omitempty"`
 	WebFQDN                    string `yaml:"web_fqdn,omitempty"`
+	WebPort                    string `yaml:"web_port,omitempty"`
 	WebRoot                    string `yaml:"web_root,omitempty"`
 	WebHistoryMode             string `yaml:"web_history_mode,omitempty"`
 	WebSchema                  string `yaml:"web_schema,omitempty"`
@@ -97,25 +98,31 @@ func (a *Auth) Obfuscate() {
 
 // PrometheusConfig describes configuration of the Prometheus component
 type PrometheusConfig struct {
-	Auth            Auth            `yaml:"auth,omitempty"`
-	ComponentStatus ComponentStatus `yaml:"component_status,omitempty"`
-	URL             string          `yaml:"url,omitempty"`
+	Auth Auth `yaml:"auth,omitempty"`
+	// Cache duration per query expressed in seconds
+	CacheDuration int `yaml:"cache_duration,omitempty"`
+	// Enable cache for Prometheus queries
+	CacheEnabled bool `yaml:"cache_enabled,omitempty"`
+	// Global cache expiration expressed in seconds
+	CacheExpiration int    `yaml:"cache_expiration:omitempty"`
+	URL             string `yaml:"url,omitempty"`
 }
 
 // CustomDashboardsConfig describes configuration specific to Custom Dashboards
 type CustomDashboardsConfig struct {
-	Enabled        bool             `yaml:"enabled,omitempty"`
-	NamespaceLabel string           `yaml:"namespace_label,omitempty"`
-	Prometheus     PrometheusConfig `yaml:"prometheus,omitempty"`
+	Enabled         bool             `yaml:"enabled,omitempty"`
+	IsCoreComponent bool             `yaml:"is_core_component,omitempty"`
+	NamespaceLabel  string           `yaml:"namespace_label,omitempty"`
+	Prometheus      PrometheusConfig `yaml:"prometheus,omitempty"`
 }
 
 // GrafanaConfig describes configuration used for Grafana links
 type GrafanaConfig struct {
 	Auth            Auth                     `yaml:"auth"`
-	ComponentStatus ComponentStatus          `yaml:"component_status,omitempty"`
 	Dashboards      []GrafanaDashboardConfig `yaml:"dashboards"`
 	Enabled         bool                     `yaml:"enabled"` // Enable or disable Grafana support in Kiali
 	InClusterURL    string                   `yaml:"in_cluster_url"`
+	IsCoreComponent bool                     `yaml:"is_core_component"`
 	URL             string                   `yaml:"url"`
 }
 
@@ -134,13 +141,13 @@ type GrafanaVariablesConfig struct {
 
 // TracingConfig describes configuration used for tracing links
 type TracingConfig struct {
-	Auth                 Auth            `yaml:"auth"`
-	ComponentStatus      ComponentStatus `yaml:"component_status,omitempty"`
-	Enabled              bool            `yaml:"enabled"` // Enable Jaeger in Kiali
-	InClusterURL         string          `yaml:"in_cluster_url"`
-	NamespaceSelector    bool            `yaml:"namespace_selector"`
-	URL                  string          `yaml:"url"`
-	WhiteListIstioSystem []string        `yaml:"whitelist_istio_system"`
+	Auth                 Auth     `yaml:"auth"`
+	Enabled              bool     `yaml:"enabled"` // Enable Jaeger in Kiali
+	InClusterURL         string   `yaml:"in_cluster_url"`
+	IsCoreComponent      bool     `yaml:"is_core_component"`
+	NamespaceSelector    bool     `yaml:"namespace_selector"`
+	URL                  string   `yaml:"url"`
+	WhiteListIstioSystem []string `yaml:"whitelist_istio_system"`
 }
 
 // IstioConfig describes configuration used for istio links
@@ -164,15 +171,6 @@ type ComponentStatus struct {
 	Namespace string `yaml:"namespace,omitempty"`
 }
 
-// ThreeScaleConfig describes configuration used for 3Scale adapter
-type ThreeScaleConfig struct {
-	AdapterName    string `yaml:"adapter_name"`
-	AdapterPort    string `yaml:"adapter_port"`
-	AdapterService string `yaml:"adapter_service"`
-	Enabled        bool   `yaml:"enabled"`
-	TemplateName   string `yaml:"template_name"`
-}
-
 type Iter8Config struct {
 	Enabled bool `yaml:"enabled"`
 	// Defein which namespace Iter8 is installed on, default to iter8
@@ -182,8 +180,7 @@ type Iter8Config struct {
 // Extensions struct describes configuration for Kiali add-ons (extensions)
 // New add-on/extension configuration should create a specif config and be located under this
 type Extensions struct {
-	ThreeScale ThreeScaleConfig `yaml:"threescale,omitempty"`
-	Iter8      Iter8Config      `yaml:"iter_8,omitempty"`
+	Iter8 Iter8Config `yaml:"iter_8,omitempty"`
 }
 
 // ExternalServices holds configurations for other systems that Kiali depends on
@@ -275,6 +272,7 @@ type OpenIdConfig struct {
 	AuthorizationEndpoint string   `yaml:"authorization_endpoint,omitempty"`
 	ClientId              string   `yaml:"client_id,omitempty"`
 	ClientSecret          string   `yaml:"client_secret,omitempty"`
+	DisableRBAC           bool     `yaml:"disable_rbac,omitempty"`
 	InsecureSkipVerifyTLS bool     `yaml:"insecure_skip_verify_tls,omitempty"`
 	IssuerUri             string   `yaml:"issuer_uri,omitempty"`
 	Scopes                []string `yaml:"scopes,omitempty"`
@@ -363,6 +361,7 @@ func NewConfig() (c *Config) {
 				AuthorizationEndpoint: "",
 				ClientId:              "",
 				ClientSecret:          "",
+				DisableRBAC:           false,
 				InsecureSkipVerifyTLS: false,
 				IssuerUri:             "",
 				Scopes:                []string{"openid", "profile", "email"},
@@ -377,13 +376,6 @@ func NewConfig() (c *Config) {
 			Namespace:            "istio-system",
 		},
 		Extensions: Extensions{
-			ThreeScale: ThreeScaleConfig{
-				AdapterName:    "threescale",
-				AdapterPort:    "3333",
-				AdapterService: "threescale-istio-adapter",
-				Enabled:        false,
-				TemplateName:   "threescale-authorization",
-			},
 			Iter8: Iter8Config{
 				Enabled:   false,
 				Namespace: "iter8",
@@ -398,11 +390,8 @@ func NewConfig() (c *Config) {
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				Enabled: true,
-				ComponentStatus: ComponentStatus{
-					AppLabel: "grafana",
-					IsCore:   false,
-				},
+				Enabled:         true,
+				IsCoreComponent: false,
 			},
 			Istio: IstioConfig{
 				IstioIdentityDomain:      "svc.cluster.local",
@@ -432,20 +421,18 @@ func NewConfig() (c *Config) {
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				ComponentStatus: ComponentStatus{
-					AppLabel: "prometheus",
-					IsCore:   true,
-				},
-				URL: "http://prometheus.istio-system:9090",
+				CacheEnabled: true,
+				// 1/2 Prom Scrape Interval
+				CacheDuration: 7,
+				// Prom Cache expires and it forces to repopulate cache
+				CacheExpiration: 300,
+				URL:             "http://prometheus.istio-system:9090",
 			},
 			Tracing: TracingConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				ComponentStatus: ComponentStatus{
-					AppLabel: "jaeger",
-					IsCore:   false,
-				},
+				IsCoreComponent:      false,
 				Enabled:              true,
 				NamespaceSelector:    true,
 				InClusterURL:         "http://tracing.istio-system/jaeger",

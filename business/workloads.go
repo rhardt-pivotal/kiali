@@ -4,17 +4,18 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	kmodel "github.com/kiali/k-charted/model"
 	osapps_v1 "github.com/openshift/api/apps/v1"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
 	batch_v1beta1 "k8s.io/api/batch/v1beta1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/kiali/kiali/config"
@@ -25,24 +26,30 @@ import (
 	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
-// Workload deals with fetching istio/kubernetes workloads related content and convert to kiali model
+// WorkloadService deals with fetching istio/kubernetes workloads related content and convert to kiali model
 type WorkloadService struct {
 	prom          prometheus.ClientInterface
 	k8s           kubernetes.ClientInterface
 	businessLayer *Layer
 }
 
-// Structures for workload log messages
+// PodLog reports log entries
 type PodLog struct {
-	Logs    string     `json:"logs,omitempty"`
 	Entries []LogEntry `json:"entries,omitempty"`
 }
 
+// LogEntry holds a single log entry
 type LogEntry struct {
 	Message       string `json:"message,omitempty"`
 	Severity      string `json:"severity,omitempty"`
 	Timestamp     string `json:"timestamp,omitempty"`
 	TimestampUnix int64  `json:"timestampUnix,omitempty"`
+}
+
+// LogOptions holds query parameter values
+type LogOptions struct {
+	Duration *time.Duration
+	core_v1.PodLogOptions
 }
 
 var (
@@ -95,7 +102,7 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 		return nil, err
 	}
 
-	var runtimes []kmodel.Runtime
+	var runtimes []models.Runtime
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
@@ -103,8 +110,7 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 		conf := config.Get()
 		app := workload.Labels[conf.IstioLabels.AppLabelName]
 		version := workload.Labels[conf.IstioLabels.VersionLabelName]
-		dash := NewDashboardsService(in.prom)
-		runtimes = dash.GetCustomDashboardRefs(namespace, app, version, workload.Pods)
+		runtimes = NewDashboardsService().GetCustomDashboardRefs(namespace, app, version, workload.Pods)
 	}()
 
 	if includeServices {
@@ -189,15 +195,72 @@ func (in *WorkloadService) GetPod(namespace, name string) (*models.Pod, error) {
 	return &pod, nil
 }
 
-func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.PodLogOptions) (*PodLog, error) {
-	podLog, err := in.k8s.GetPodLogs(namespace, name, opts)
+func (in *WorkloadService) BuildLogOptionsCriteria(container string, duration string, sinceTime string, tailLines string) (*LogOptions, error) {
+	opts := &LogOptions{}
+	opts.PodLogOptions = core_v1.PodLogOptions{Timestamps: true}
+
+	if container != "" {
+		opts.Container = container
+	}
+
+	if duration != "" {
+		duration, err := time.ParseDuration(duration)
+
+		if err != nil {
+			return nil, fmt.Errorf("Invalid duration [%s]: %v", duration, err)
+		}
+
+		opts.Duration = &duration
+	}
+
+	if sinceTime != "" {
+		numTime, err := strconv.ParseInt(sinceTime, 10, 64)
+
+		if err != nil {
+			return nil, fmt.Errorf("Invalid sinceTime [%s]: %v", sinceTime, err)
+		}
+
+		opts.SinceTime = &meta_v1.Time{Time: time.Unix(numTime, 0)}
+	}
+
+	if tailLines != "" {
+		if numLines, err := strconv.ParseInt(tailLines, 10, 64); err == nil {
+			if numLines > 0 {
+				opts.TailLines = &numLines
+			}
+		} else {
+			return nil, fmt.Errorf("Invalid tailLines [%s]: %v", tailLines, err)
+		}
+	}
+
+	return opts, nil
+}
+
+func (in *WorkloadService) getParsedLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
+	k8sOpts := opts.PodLogOptions
+	// the k8s API does not support "endTime/beforeTime". So for bounded time ranges we need to
+	// 1) discard the logs after sinceTime+duration
+	// 2) manually apply tailLines to the remaining logs
+	isBounded := opts.Duration != nil
+	tailLines := k8sOpts.TailLines
+	if isBounded {
+		k8sOpts.TailLines = nil
+	}
+
+	podLog, err := in.k8s.GetPodLogs(namespace, name, &k8sOpts)
 
 	if err != nil {
 		return nil, err
 	}
 
 	lines := strings.Split(podLog.Logs, "\n")
-	messages := make([]LogEntry, 0)
+	entries := make([]LogEntry, 0)
+
+	var startTime *time.Time
+	var endTime *time.Time
+	if k8sOpts.SinceTime != nil {
+		startTime = &k8sOpts.SinceTime.Time
+	}
 
 	for _, line := range lines {
 		entry := LogEntry{
@@ -222,9 +285,28 @@ func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.P
 		}
 
 		entry.Message = strings.TrimSpace(splitted[1])
+		if entry.Message == "" {
+			log.Debugf("Skipping empty log line [%s]", line)
+			continue
+		}
 
 		parsed, err := time.Parse(time.RFC3339, entry.Timestamp)
 		if err == nil {
+			if startTime == nil {
+				startTime = &parsed
+			}
+
+			if isBounded {
+				if endTime == nil {
+					end := parsed.Add(*opts.Duration)
+					endTime = &end
+				}
+
+				if parsed.After(*endTime) {
+					break
+				}
+			}
+
 			entry.TimestampUnix = parsed.Unix()
 		} else {
 			log.Debugf("Failed to parse log timestamp (skipping) [%s], %s", entry.Timestamp, err.Error())
@@ -236,18 +318,22 @@ func (in *WorkloadService) getParsedLogs(namespace, name string, opts *core_v1.P
 			entry.Severity = strings.ToUpper(severity)
 		}
 
-		messages = append(messages, entry)
+		entries = append(entries, entry)
+	}
+
+	if isBounded && tailLines != nil && len(entries) > int(*tailLines) {
+		entries = entries[len(entries)-int(*tailLines):]
 	}
 
 	message := PodLog{
-		Logs:    podLog.Logs,
-		Entries: messages,
+		Entries: entries,
 	}
 
 	return &message, err
 }
 
-func (in *WorkloadService) GetPodLogs(namespace, name string, opts *core_v1.PodLogOptions) (*PodLog, error) {
+// GetPodLogs returns pod logs given the provided options
+func (in *WorkloadService) GetPodLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
 	return in.getParsedLogs(namespace, name, opts)
 }
 
